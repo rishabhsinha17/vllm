@@ -799,7 +799,11 @@ class OpenAIServingResponses(GenerateBaseServing):
             final_output = final_res.outputs[0]
 
             # finish_reason='error' indicates retryable internal error
-            self._raise_if_error(final_output.finish_reason, request.request_id)
+            self._raise_if_error(
+                final_output.finish_reason,
+                request.request_id,
+                final_output.stop_reason,
+            )
 
             # Check if generation was stopped due to max_tokens
             if final_output.finish_reason == "length":
@@ -1215,7 +1219,9 @@ class OpenAIServingResponses(GenerateBaseServing):
                 continue
 
             output = ctx.last_output.outputs[0]
-            self._raise_if_error(output.finish_reason, request.request_id)
+            self._raise_if_error(
+                output.finish_reason, request.request_id, output.stop_reason
+            )
             delta_text = output.text
             delta_token_ids = as_list(output.token_ids)
 

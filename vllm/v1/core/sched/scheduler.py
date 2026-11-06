@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.exceptions import NIXL_KV_LEASE_EXPIRED
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
@@ -1993,9 +1994,13 @@ class Scheduler(SchedulerInterface):
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids: set[str] = set()
+        declined_expired_req_ids: set[str] = set()
         if kv_connector_output and kv_connector_output.failed_recving:
             failed_kv_load_req_ids.update(
                 self._handle_failed_recving(kv_connector_output.failed_recving)
+            )
+            declined_expired_req_ids = set(
+                kv_connector_output.declined_expired_recving
             )
         if kv_connector_output and kv_connector_output.invalid_block_ids:
             # These blocks contain externally computed tokens that failed to
@@ -2238,6 +2243,12 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_mismatch_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
+            # A stale remote lease is retryable: the router should prefill
+            # again rather than decode whatever now occupies those blocks.
+            for req_id in declined_expired_req_ids & error_req_ids:
+                request = self.requests.get(req_id)
+                if request is not None:
+                    request.stop_reason = NIXL_KV_LEASE_EXPIRED
         if self.ec_connector is not None:
             # An encoder input the connector can no longer obtain. Failing is
             # retryable: re-issuing the request re-runs the encode.
@@ -2253,6 +2264,7 @@ class Scheduler(SchedulerInterface):
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
+                        stop_reason=request.stop_reason,
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
                     )

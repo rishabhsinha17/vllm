@@ -57,6 +57,16 @@ def get_representative_spec_type(spec: KVCacheSpec) -> type[KVCacheSpec]:
     return type(spec)
 
 
+def kv_lease_extension(kv_lease_duration: int) -> int:
+    """Seconds a heartbeat extends a KV lease by on the producer.
+
+    Shared by the producer (``_handle_heartbeat`` renews each lease to
+    ``now + extension``) and by its export in ``kv_transfer_params``, so the
+    consumer models the same renewal its own heartbeats cause.
+    """
+    return kv_lease_duration * 2 // 3
+
+
 # Trailing 8-hex randomization suffix appended by
 # ``input_processor.assign_request_id`` as ``-{random_uuid():.8}``.
 _RANDOM_SUFFIX_RE = re.compile(r"-[0-9a-f]{8}$", re.IGNORECASE)

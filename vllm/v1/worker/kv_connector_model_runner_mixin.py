@@ -97,6 +97,7 @@ class KVConnectorModelRunnerMixin:
             output.finished_sending = transfer_results.finished_sending
             output.finished_recving = transfer_results.finished_recving
             output.failed_recving = transfer_results.failed_recving
+            output.declined_expired_recving = transfer_results.declined_expired_recving
             output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
 
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()

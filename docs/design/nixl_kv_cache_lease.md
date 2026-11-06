@@ -42,6 +42,22 @@ Tracking stops when either the KV transfer completes (via `update_connector_outp
 
 Heartbeat sending and processing happen **in the forward loop**, not in a background thread. This means timing is not millisecond-precise --- a long model forward pass will delay heartbeats. However, the lease durations are configured with sufficient margin: with default settings, the heartbeat interval (~5s) and lease extension (~20s) are at least an order of magnitude larger than a typical forward pass. This avoids lock complexity between threads while keeping the design simple and extensible.
 
+### Stale read protection
+
+Heartbeats start only once the request has entered D's scheduler. A router that holds the prefilled request *outside* D (for example while D is at capacity) renews nothing. P's lease then runs out, P recycles the blocks, and D's later NIXL read succeeds against whatever now occupies that memory. That is silent cross-request KV reuse: another request's cache, and for hybrid models its recurrent state, is decoded as this request's. The failure is a confidentiality and integrity bug, not only a crash. NaN logits and illegal memory accesses are one symptom; a request that keeps producing plausible tokens from another tenant's prefix is the same bug.
+
+P exports the lease deadline on prefill blocks (`remote_blocks_expiry_time`, in P's `perf_counter` domain) and `remote_lease_extension` (seconds each heartbeat renews the lease). Before issuing a read, D rebases the deadline with the handshake clock offset and declines the read when it is inside a 5s safety margin of now. D models the renewals its own heartbeats caused, using the producer's rule (`send time + extension` while the modelled lease is still alive; a heartbeat after the lease lapsed renews nothing). A declined read is `failed_recving`, counted in `vllm:nixl_num_declined_expired_reads`, and follows `kv_load_failure_policy`. With the default `fail`, the request finishes with `finish_reason=error` and `stop_reason=nixl_kv_lease_expired`, and the API error text contains that token so a router can retry a fresh prefill. `recompute` prefills locally instead.
+
+The same decline covers hybrid recurrent state. SSM state rides in the same remote read as the KV blocks, and the producer frees both when the lease ends. There is no second fetch that could load a recycled RNN slot after the KV read was refused.
+
+What this does not cover:
+
+- Peers that export no deadline or no renewal amount, or for which no clock offset is known, are read as before. A proxy that strips those fields restores the silent reuse. That fail-open is a compatibility choice, not a guarantee.
+- A heartbeat that arrives at P after the lease has already been reaped. The model credits the renewal at send time.
+- Request ids containing `,` (the heartbeat payload is comma-separated).
+- A lease that runs out while the transfer is already in flight.
+- Replayed `kv_transfer_params`, or a producer restarted behind the same engine id.
+
 ## Happy Path
 
 ```mermaid
@@ -132,5 +148,7 @@ vllm serve <MODEL> \
     "kv_connector_extra_config": {"kv_lease_duration": 60}
   }'
 ```
+
+`kv_load_failure_policy` (top-level `--kv-transfer-config`, default `fail`) decides what happens when a remote read is declined because the lease ran out: `fail` ends the request with error `nixl_kv_lease_expired`, `recompute` prefills it locally.
 
 For full NixlConnector configuration details, see the [NixlConnector Usage Guide](../features/nixl_connector_usage.md).

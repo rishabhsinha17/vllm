@@ -14,6 +14,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
@@ -60,6 +61,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
     get_representative_spec_type,
+    kv_lease_extension,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
@@ -108,6 +110,28 @@ def _region_sort_key(layer_name: str) -> tuple[tuple[int, int | str], ...]:
         (0, int(part)) if part.isdigit() else (1, part)
         for part in re.split(r"(\d+)", layer_name)
     )
+
+
+# Slack (seconds) between a modelled remote lease deadline and the moment this
+# worker acts on it (sends a heartbeat that must still find the lease alive, or
+# posts a read). It absorbs handshake clock-offset error and notification delay.
+_KV_BLOCKS_EXPIRY_SAFETY_MARGIN = 5.0
+
+
+@dataclass
+class RemoteLeaseModel:
+    """The remote's lease on one request's KV blocks, as renewed by the
+    heartbeats this worker sent (deadline in our perf_counter domain).
+
+    Mirrors ``_handle_heartbeat`` on the remote: a heartbeat sent while the
+    lease is alive renews it to ``now + extension``; one sent after it ran out
+    renews nothing, and nothing after it does either. Send time plus the
+    safety margin stands in for the arrival time, so the model can only lag
+    the real lease.
+    """
+
+    deadline: float
+    alive: bool = True
 
 
 def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
@@ -534,8 +558,7 @@ class NixlBaseConnectorWorker:
         kv_lease_duration: int = vllm_config.kv_transfer_config.get_from_extra_config(
             "kv_lease_duration", 30
         )
-        # NOTE (NickLucche): For now we use a hardcoded value for a simpler interface.
-        self._lease_extension = kv_lease_duration * 2 // 3
+        self._lease_extension = kv_lease_extension(kv_lease_duration)
 
         self._bidirectional_kv_xfer_enabled: bool = (
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -655,6 +678,10 @@ class NixlBaseConnectorWorker:
         )
         # Map of engine_id -> clock offset.
         self._engine_clock_offset: dict[EngineId, float] = {}
+        # Remote leases renewed by heartbeats this worker sent, so a pull can
+        # tell a live producer lease from one that already freed the blocks.
+        # Keyed by (remote engine id, remote request id).
+        self._remote_leases: dict[tuple[EngineId, str], RemoteLeaseModel] = {}
 
         # Metadata.
         self.engine_id: EngineId = engine_id
@@ -817,6 +844,9 @@ class NixlBaseConnectorWorker:
         # background handshake thread, matching the _ready_requests pattern.
         self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
         self._recv_failures: set[ReqId] = set()
+        # Subset of receive failures that were declined because the remote
+        # lease had run out (as opposed to a transport failure).
+        self._declined_expired_reqs: set[ReqId] = set()
         self._pending_recv_notifs: dict[ReqId, list[tuple[str, bytes]]] = {}
 
         # Handshake metadata of this worker for NIXL transfers.
@@ -2852,10 +2882,19 @@ class NixlBaseConnectorWorker:
             for req_id in tuple(self._recv_failures):
                 if req_id not in self._recving_metadata:
                     self._recv_failures.remove(req_id)
+                    declined = getattr(self, "_declined_expired_reqs", None)
+                    if declined is not None:
+                        declined.discard(req_id)
                 elif req_id not in self._recving_transfers:
                     self._recv_failures.remove(req_id)
                     failed_recv_reqs.add(req_id)
             done_recving.update(failed_recv_reqs)
+        declined_tracked = getattr(self, "_declined_expired_reqs", None)
+        if declined_tracked is None:
+            declined_expired: set[ReqId] = set()
+        else:
+            declined_expired = failed_recv_reqs & declined_tracked
+            declined_tracked -= failed_recv_reqs
 
         if len(done_sending) > 0 or len(done_recving) > 0:
             logger.debug(
@@ -2874,6 +2913,17 @@ class NixlBaseConnectorWorker:
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
+            remote = getattr(meta, "remote", None)
+            leases = getattr(self, "_remote_leases", None)
+            if (
+                leases is not None
+                and remote is not None
+                and isinstance(getattr(remote, "engine_id", None), str)
+                and isinstance(getattr(remote, "request_id", None), str)
+            ):
+                # Heartbeats may have gone out between the read and its
+                # completion; drop the model once the transfer is decided.
+                leases.pop((remote.engine_id, remote.request_id), None)
 
             # Skip KV sync and post-processing for failed requests
             if req_id in failed_recv_reqs:
@@ -2974,6 +3024,7 @@ class NixlBaseConnectorWorker:
             finished_sending=done_sending,
             finished_recving=done_recving,
             failed_recving=failed_recv_reqs,
+            declined_expired_recving=declined_expired,
         )
 
     def get_finished(self) -> tuple[set[str], set[str]]:
@@ -3129,7 +3180,10 @@ class NixlBaseConnectorWorker:
 
     def _send_heartbeats(self, metadata: NixlConnectorMetadata) -> None:
         """Send heartbeats to remote engines, extending the lease on KV blocks."""
+        now = time.perf_counter()
+        live_remote_reqs: set[tuple[EngineId, str]] = set()
         for engine_id, hb_info in metadata.heartbeat_by_engine.items():
+            live_remote_reqs.update((engine_id, req_id) for req_id in hb_info.req_ids)
             # Proactive handshake (this request may still be in waiting queue) so
             # the **next** heartbeat for this remote can go through.
             if (
@@ -3148,15 +3202,62 @@ class NixlBaseConnectorWorker:
 
             # Build the heartbeat message: "HB:req1,req2,..."
             hb_msg = ("HB:" + ",".join(hb_info.req_ids)).encode()
+            all_sent = True
             for agent_name in self._remote_agents[engine_id].values():
                 try:
                     self.nixl_wrapper.send_notif(agent_name, notif_msg=hb_msg)
                 except Exception:
+                    all_sent = False
                     logger.debug(
                         "Failed to send heartbeat to engine %s",
                         engine_id,
                         exc_info=True,
                     )
+            clock_offset = self._engine_clock_offset.get(engine_id)
+            if all_sent and clock_offset is not None and self._TRANSFER_MODE == "pull":
+                # A round that missed a rank is not counted: one rank freeing
+                # its shard is enough to corrupt the read. Only the pull
+                # worker reads remote blocks, so only it keeps the models.
+                for remote_req_id, (expiry, extension) in hb_info.leases.items():
+                    if "," in remote_req_id:
+                        # The payload is comma-separated, so the remote cannot
+                        # match this id and renews nothing for it.
+                        continue
+                    self._record_heartbeat_sent(
+                        (engine_id, remote_req_id),
+                        now,
+                        expiry - clock_offset,
+                        extension,
+                    )
+        if metadata.heartbeat_by_engine:
+            # The scheduler ships its whole heartbeat set each round. A request
+            # missing from it stopped waiting. This only bounds bookkeeping for
+            # requests that never reach a read; the read itself pops its entry.
+            for key in list(self._remote_leases):
+                if key not in live_remote_reqs:
+                    del self._remote_leases[key]
+
+    def _record_heartbeat_sent(
+        self,
+        key: tuple[EngineId, str],
+        now: float,
+        deadline: float,
+        extension: int,
+    ) -> None:
+        """Apply one heartbeat sent at ``now`` to the model of the remote lease
+        whose initial deadline (our clock) is ``deadline``.
+        """
+        model = self._remote_leases.get(key)
+        if model is None:
+            model = self._remote_leases[key] = RemoteLeaseModel(deadline)
+        if not model.alive:
+            return
+        if now + _KV_BLOCKS_EXPIRY_SAFETY_MARGIN <= model.deadline:
+            model.deadline = max(model.deadline, now + extension)
+        else:
+            # The lease ran out before this heartbeat could reach the remote.
+            # Later heartbeats renew nothing.
+            model.alive = False
 
     def get_mapped_blocks(
         self, block_ids: np.ndarray, block_size_ratio: int

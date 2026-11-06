@@ -48,8 +48,13 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  10: Add dense virtual transfer pages for compressed MLA caches
 #  11: Add per-region transfer geometry and memory types to NixlAgentMetadata
 #  12: Add per-region member names for PP push
+#  13: Export remote_blocks_expiry_time for P blocks too, plus
+#      remote_lease_extension; the consumer gates every remote read on it.
+#      Upstream vLLM (connector version 16) makes the same change as 17 in
+#      https://github.com/vllm-project/vllm/pull/66011. This fork's tree is
+#      at 12, so the incompatible bump here is 13.
 #
-NIXL_CONNECTOR_VERSION: int = 12
+NIXL_CONNECTOR_VERSION: int = 13
 
 
 @dataclass
@@ -219,6 +224,10 @@ class HeartbeatInfo:
     tp_size: int
     dcp_size: int = 1
     pp_size: int = 1
+    # Per remote request id, the lease deadline the remote exported (its
+    # perf_counter) and the seconds each heartbeat renews it by, when the
+    # remote provided both. The worker models the lease it renews from these.
+    leases: dict[ReqId, tuple[float, int]] = field(default_factory=dict)
 
 
 @dataclass

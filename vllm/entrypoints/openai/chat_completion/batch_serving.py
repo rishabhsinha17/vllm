@@ -248,7 +248,9 @@ class OpenAIServingChatBatch(OpenAIServingChat):
             )
 
             for output in final_res.outputs:
-                self._raise_if_error(output.finish_reason, request_id)
+                self._raise_if_error(
+                    output.finish_reason, request_id, output.stop_reason
+                )
 
                 if request.logprobs and (
                     request.top_logprobs is not None or request.logprob_token_ids

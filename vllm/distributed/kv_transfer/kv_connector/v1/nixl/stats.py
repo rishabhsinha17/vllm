@@ -41,6 +41,7 @@ class NixlKVConnectorStats(KVConnectorStats):
             "num_failed_notifications": [],
             "num_failed_handshakes": [],
             "num_kv_expired_reqs": [],
+            "num_declined_expired_reads": [],
         }
 
     def record_transfer(self, res: "nixlXferTelemetry"):
@@ -66,6 +67,10 @@ class NixlKVConnectorStats(KVConnectorStats):
         """Record a request that had its KV blocks expire."""
         self.data["num_kv_expired_reqs"].append(1)
 
+    def record_declined_expired_read(self):
+        """Record a remote read declined because the remote lease ran out."""
+        self.data["num_declined_expired_reads"].append(1)
+
     def clone_and_reset(self) -> "NixlKVConnectorStats":
         old = copy.copy(self)
         self.reset()
@@ -79,6 +84,7 @@ class NixlKVConnectorStats(KVConnectorStats):
             and len(self.data["num_failed_notifications"]) == 0
             and len(self.data["num_failed_handshakes"]) == 0
             and len(self.data["num_kv_expired_reqs"]) == 0
+            and len(self.data.get("num_declined_expired_reads", [])) == 0
         )
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
@@ -101,6 +107,9 @@ class NixlKVConnectorStats(KVConnectorStats):
             + len(self.data["num_failed_handshakes"])
             + len(self.data["num_failed_notifications"]),
             "Num KV expired reqs": len(self.data["num_kv_expired_reqs"]),
+            "Num declined expired reads": len(
+                self.data.get("num_declined_expired_reads", [])
+            ),
         }
         if self.num_successful_transfers == 0:
             # Timing / throughput stats only cover successful transfers. If
@@ -262,6 +271,19 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             counter_nixl_num_kv_expired_reqs, self.per_engine_labelvalues
         )
 
+        counter_nixl_num_declined_expired_reads = self._counter_cls(
+            name="vllm:nixl_num_declined_expired_reads",
+            documentation="Number of remote KV reads declined because the remote "
+            "had released the blocks (lease expired) before the read. Each one "
+            "follows kv_load_failure_policy and, with the default fail policy, "
+            "surfaces as request error nixl_kv_lease_expired. NOTE: tracked on "
+            "the reading (consumer) instance.",
+            labelnames=labelnames,
+        )
+        self.counter_nixl_num_declined_expired_reads = create_metric_per_engine(
+            counter_nixl_num_declined_expired_reads, self.per_engine_labelvalues
+        )
+
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         for prom_obj, list_item_key in zip(
             [
@@ -284,12 +306,13 @@ class NixlPromMetrics(KVConnectorPromMetrics):
                 self.counter_nixl_num_failed_transfers,
                 self.counter_nixl_num_failed_notifications,
                 self.counter_nixl_num_kv_expired_reqs,
+                self.counter_nixl_num_declined_expired_reads,
             ],
             [
                 # Transfer, handshake and notification failures are grouped:
                 # all are sporadic lower-transport-layer events. KV expiry is
                 # reported separately as it signals autoscaler behavior, not
-                # transport health.
+                # transport health. Declined reads are the consumer-side view.
                 (
                     "num_failed_transfers",
                     "num_failed_handshakes",
@@ -297,8 +320,10 @@ class NixlPromMetrics(KVConnectorPromMetrics):
                 ),
                 ("num_failed_notifications",),
                 ("num_kv_expired_reqs",),
+                ("num_declined_expired_reads",),
             ],
         ):
             for counter_item_key in counter_item_keys:
-                for list_item in transfer_stats_data[counter_item_key]:
+                # Absent on stats serialized by an older worker.
+                for list_item in transfer_stats_data.get(counter_item_key, []):
                     counter_obj[engine_idx].inc(list_item)

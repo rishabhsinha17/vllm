@@ -122,6 +122,12 @@ class VLLMUnprocessableEntityError(VLLMClientError):
         return f"{base} ({', '.join(extras)})" if extras else base
 
 
+# Stable request-error token when a consumer refuses a remote KV read
+# because the producer's lease expired and the blocks may have been reused.
+# Routers match this string to retry with a fresh prefill.
+NIXL_KV_LEASE_EXPIRED = "nixl_kv_lease_expired"
+
+
 class GenerationError(VLLMServerError):
     """raised when finish_reason indicates internal server error (500)"""
 

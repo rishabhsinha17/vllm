@@ -318,7 +318,9 @@ class ServingTokens(GenerateBaseServing):
         choices: list[GenerateResponseChoice] = []
         num_generated_tokens = 0
         for output in final_res.outputs:
-            self._raise_if_error(output.finish_reason, request_id)
+            self._raise_if_error(
+                output.finish_reason, request_id, output.stop_reason
+            )
 
             token_ids = output.token_ids
             out_logprobs = output.logprobs
@@ -459,7 +461,9 @@ class ServingTokens(GenerateBaseServing):
                     num_generated_tokens[i] += len(delta_token_ids)
 
                     finish_reason = output.finish_reason
-                    self._raise_if_error(finish_reason, request_id)
+                    self._raise_if_error(
+                        finish_reason, request_id, output.stop_reason
+                    )
 
                     # Still emit a terminal empty chunk while prompt metadata
                     # is pending, so zero-token completions deliver it.

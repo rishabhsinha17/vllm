@@ -231,7 +231,12 @@ class NixlBaseConnectorScheduler:
                 dcp_size=dcp_size,
                 pp_size=pp_size,
             )
-        self._heartbeat_by_engine[remote_engine_id].req_ids.add(remote_request_id)
+        info = self._heartbeat_by_engine[remote_engine_id]
+        info.req_ids.add(remote_request_id)
+        expiry = params.get("remote_blocks_expiry_time")
+        extension = params.get("remote_lease_extension")
+        if expiry is not None and extension is not None:
+            info.leases[remote_request_id] = (float(expiry), int(extension))
         self._heartbeat_req_engine[request.request_id] = (
             remote_engine_id,
             remote_request_id,
@@ -243,6 +248,7 @@ class NixlBaseConnectorScheduler:
             engine_id, remote_id = key
             if info := self._heartbeat_by_engine.get(engine_id):
                 info.req_ids.discard(remote_id)
+                info.leases.pop(remote_id, None)
                 if not info.req_ids:
                     # Clean up empty engines so we don't leak a key when remote dies.
                     del self._heartbeat_by_engine[engine_id]

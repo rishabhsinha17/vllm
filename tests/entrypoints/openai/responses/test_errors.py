@@ -9,7 +9,7 @@ import pytest
 import vllm.envs as envs
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 from vllm.envs import disable_envs_cache
-from vllm.exceptions import GenerationError
+from vllm.exceptions import NIXL_KV_LEASE_EXPIRED, GenerationError
 
 
 @pytest.mark.asyncio
@@ -33,6 +33,11 @@ async def test_raise_if_error_raises_generation_error():
 
     assert str(exc_info.value) == "Internal server error"
     assert exc_info.value.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+
+    with pytest.raises(GenerationError) as lease_exc:
+        serving._raise_if_error("error", "test-request-id", NIXL_KV_LEASE_EXPIRED)
+    assert NIXL_KV_LEASE_EXPIRED in str(lease_exc.value)
+    assert "fresh prefill" in str(lease_exc.value)
 
     # test that other finish_reasons don't raise
     serving._raise_if_error("stop", "test-request-id")  # should not raise

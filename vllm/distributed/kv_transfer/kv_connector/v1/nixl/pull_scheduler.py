@@ -9,6 +9,9 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    kv_lease_extension,
+)
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -264,9 +267,13 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             self._reqs_need_send[request.request_id] = (
                 time.perf_counter() + request_kv_blocks_ttl
             )
-            if is_d_node:
-                # D blocks expiry time exported for the turn-2 readback.
-                blocks_expiry_time = self._reqs_need_send[request.request_id]
+            # Export the deadline so the consumer can tell a live lease from an
+            # expired one before it issues the NIXL read. Past the deadline the
+            # blocks have been recycled and the read returns someone else's KV
+            # (and, for hybrid models, their recurrent state). P blocks carry
+            # the initial lease, which heartbeats extend; D blocks carry the
+            # fixed turn-2 TTL.
+            blocks_expiry_time = self._reqs_need_send[request.request_id]
             # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
             # trimming down after allocating for the whole sequence length. Empty
             # blocks are always at the start of the list.
@@ -288,5 +295,12 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             pp_size=self.vllm_config.parallel_config.pipeline_parallel_size,
             remote_num_tokens=remote_num_tokens,
             remote_blocks_expiry_time=blocks_expiry_time,
+            # Seconds each heartbeat renews the lease by on this side.
+            # Turn-2 D blocks use a fixed TTL, so they export no extension.
+            remote_lease_extension=(
+                kv_lease_extension(self._kv_lease_duration)
+                if is_p_node and blocks_expiry_time is not None
+                else None
+            ),
             transfer_mode=self._TRANSFER_MODE,
         )
