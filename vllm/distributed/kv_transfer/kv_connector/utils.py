@@ -59,6 +59,7 @@ class KVOutputAggregator:
         self._recv_remaining_count = dict[str, int]()
         self._send_remaining_count = dict[str, int]()
         self._failed_recving_pending = set[str]()
+        self._declined_expired_pending = set[str]()
         self._expected_finished_count = expected_finished_count
 
     @classmethod
@@ -156,9 +157,12 @@ class KVOutputAggregator:
 
             invalid_block_ids |= kv_output.invalid_block_ids
             self._failed_recving_pending |= kv_output.failed_recving
+            self._declined_expired_pending |= kv_output.declined_expired_recving
 
         failed_recving = self._failed_recving_pending & finished_recving
         self._failed_recving_pending -= failed_recving
+        declined_expired_recving = self._declined_expired_pending & finished_recving
+        self._declined_expired_pending -= declined_expired_recving
 
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
@@ -172,6 +176,7 @@ class KVOutputAggregator:
             kv_connector_worker_meta=aggregated_kv_connector_worker_meta or None,
             invalid_block_ids=invalid_block_ids,
             failed_recving=failed_recving,
+            declined_expired_recving=declined_expired_recving,
             expected_finished_count=self._expected_finished_count,
         )
 

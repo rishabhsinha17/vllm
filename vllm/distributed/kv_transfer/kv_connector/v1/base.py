@@ -93,6 +93,9 @@ class KVConnectorTransferResults:
     finished_sending: set[str] = field(default_factory=set)
     finished_recving: set[str] = field(default_factory=set)
     failed_recving: set[str] = field(default_factory=set)
+    # Subset of failed_recving whose remote KV lease had already run out.
+    # The scheduler surfaces these as stop_reason nixl_kv_lease_expired.
+    declined_expired_recving: set[str] = field(default_factory=set)
 
 
 class SupportsHMA(ABC):

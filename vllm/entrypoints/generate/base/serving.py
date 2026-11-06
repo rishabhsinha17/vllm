@@ -26,7 +26,7 @@ from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.engine.serving import BaseServing
 from vllm.entrypoints.serve.engine.typing import AnyRequest
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.exceptions import GenerationError
+from vllm.exceptions import NIXL_KV_LEASE_EXPIRED, GenerationError
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
@@ -202,9 +202,25 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         )
         return json_str
 
-    def _raise_if_error(self, finish_reason: str | None, request_id: str) -> None:
+    def _raise_if_error(
+        self,
+        finish_reason: str | None,
+        request_id: str,
+        stop_reason: int | str | None = None,
+    ) -> None:
         """Raise GenerationError if finish_reason indicates an error."""
         if finish_reason == "error":
+            if stop_reason == NIXL_KV_LEASE_EXPIRED:
+                logger.error(
+                    "Request %s failed because the remote KV lease expired "
+                    "before the decode read",
+                    request_id,
+                )
+                raise GenerationError(
+                    "Remote KV lease expired before the decode read; the "
+                    "blocks may have been reused by another request. Retry "
+                    f"with a fresh prefill ({NIXL_KV_LEASE_EXPIRED})."
+                )
             logger.error(
                 "Request %s failed with an internal error during generation",
                 request_id,
